@@ -12,8 +12,10 @@ import json
 import hashlib
 from dataclasses import dataclass, field
 from enum import Enum
-from typing import Any, Optional
+from typing import Any, Optional, Literal
 from datetime import datetime, timezone
+
+from pydantic import BaseModel, Field
 
 
 # ──────────────────────────────────────────────
@@ -90,6 +92,28 @@ class FieldValue:
         }
 
 
+class ProjectionError(ValueError):
+    """Raised when a projected field cannot be resolved or is required but missing."""
+
+
+class FieldSpec(BaseModel):
+    path: str
+    from_: str = Field(alias="from")
+    type: str = "string"
+    required: bool = False
+    normalize: Optional[str] = None
+
+    class Config:
+        populate_by_name = True
+
+
+class OutputConfig(BaseModel):
+    fields: list[FieldSpec]
+    include_confidence: bool = True
+    include_provenance: bool = True
+    on_missing: Literal["null", "omit", "error"] = "null"
+
+
 @dataclass
 class CanonicalProfile:
     """The single trustworthy output profile."""
@@ -114,23 +138,15 @@ class CanonicalProfile:
     overall_confidence: float = 0.0
     created_at: str = field(default_factory=lambda: datetime.now(timezone.utc).isoformat())
 
-    def to_dict(self) -> dict:
-        fields = [
-            "name", "email", "phone", "current_company", "title",
-            "location", "summary", "skills", "years_of_experience",
-            "linkedin", "github", "website", "education", "languages", "top_repos",
-        ]
+    def to_dict(self, config: OutputConfig | dict | None = None) -> dict:
         out: dict[str, Any] = {
             "candidate_id": self.candidate_id,
             "created_at": self.created_at,
             "sources_used": self.sources_used,
             "overall_confidence": round(self.overall_confidence, 3),
             "conflicts": self.conflicts,
-            "fields": {},
+            "fields": project_profile(self, config),
         }
-        for f in fields:
-            fv: Optional[FieldValue] = getattr(self, f)
-            out["fields"][f] = fv.to_dict() if fv else None
         return out
 
 
@@ -569,6 +585,156 @@ def _merge_field(existing: Optional[FieldValue], incoming: Optional[FieldValue],
     return winner
 
 
+def build_default_output_config() -> OutputConfig:
+    fields = [
+        FieldSpec(path="candidate_id", from_="candidate_id", type="string"),
+        FieldSpec(path="name", from_="name", type="string"),
+        FieldSpec(path="email", from_="email", type="string"),
+        FieldSpec(path="phone", from_="phone", type="string"),
+        FieldSpec(path="current_company", from_="current_company", type="string"),
+        FieldSpec(path="title", from_="title", type="string"),
+        FieldSpec(path="location", from_="location", type="string"),
+        FieldSpec(path="summary", from_="summary", type="string"),
+        FieldSpec(path="skills", from_="skills", type="string[]"),
+        FieldSpec(path="years_of_experience", from_="years_of_experience", type="number"),
+        FieldSpec(path="linkedin", from_="linkedin", type="string"),
+        FieldSpec(path="github", from_="github", type="string"),
+        FieldSpec(path="website", from_="website", type="string"),
+        FieldSpec(path="education", from_="education", type="string"),
+        FieldSpec(path="languages", from_="languages", type="string[]"),
+        FieldSpec(path="top_repos", from_="top_repos", type="string[]"),
+    ]
+    return OutputConfig(fields=fields)
+
+
+def _normalize_for_projection(value: Any, normalize: Optional[str]) -> Any:
+    if value is None or not normalize:
+        return value
+    norm = normalize.lower()
+    if norm == "e164" and isinstance(value, str):
+        normalized, _ = normalize_phone(value)
+        return normalized or value
+    if norm == "canonical":
+        if isinstance(value, str):
+            normalized, _ = normalize_name(value)
+            return normalized or value
+        if isinstance(value, list):
+            return [normalize_name(str(item))[0] if item is not None else item for item in value]
+    if norm == "skills":
+        if isinstance(value, (list, tuple, set)):
+            normalized, _ = normalize_skills(list(value))
+            return normalized
+        normalized, _ = normalize_skills(value)
+        return normalized
+    return value
+
+
+def _resolve_path_value(source: Any, path: str) -> Any:
+    if not path:
+        return source
+
+    tokens = re.split(r"\.(?![^\[]*\])", path)
+
+    def resolve_tokens(current: Any, remaining: list[str]) -> Any:
+        if not remaining:
+            return current
+        if current is None:
+            return None
+        if isinstance(current, FieldValue):
+            current = current.value
+        token = remaining[0]
+        if token.endswith("]"):
+            base, index = token[:-1].split("[", 1)
+            if base:
+                if isinstance(current, dict):
+                    current = current.get(base)
+                else:
+                    current = getattr(current, base, None)
+            else:
+                current = current
+            if index == "":
+                if not isinstance(current, list):
+                    return None
+                if len(remaining) == 1:
+                    return current
+                values = []
+                for item in current:
+                    resolved = resolve_tokens(item, remaining[1:])
+                    if resolved is not None:
+                        values.append(resolved)
+                return values if values else None
+            try:
+                idx = int(index)
+            except ValueError:
+                return None
+            if not isinstance(current, list):
+                return None
+            if 0 <= idx < len(current):
+                return resolve_tokens(current[idx], remaining[1:])
+            return None
+
+        if isinstance(current, dict):
+            current = current.get(token)
+        else:
+            current = getattr(current, token, None)
+        return resolve_tokens(current, remaining[1:])
+
+    return resolve_tokens(source, tokens)
+
+
+def _serialize_field_value(value: Any, include_confidence: bool, include_provenance: bool) -> Any:
+    if isinstance(value, FieldValue):
+        payload: dict[str, Any] = {}
+        if include_confidence:
+            payload["confidence"] = round(value.confidence, 3)
+        if include_provenance:
+            payload["source"] = value.source.value
+            payload["raw_value"] = value.raw_value
+            payload["extracted_at"] = value.extracted_at
+        if payload:
+            payload["value"] = value.value
+            return payload
+        return value.value
+    return value
+
+
+def validate_projected_output(projected: dict, config: OutputConfig) -> dict:
+    for field_spec in config.fields:
+        if not field_spec.required:
+            continue
+        if field_spec.path in projected and projected.get(field_spec.path) is not None:
+            continue
+        if config.on_missing == "error":
+            raise ProjectionError(f"Required field '{field_spec.path}' is missing")
+    return projected
+
+
+def project_profile(profile: CanonicalProfile, config: OutputConfig | dict | None) -> dict:
+    if config is None:
+        config = build_default_output_config()
+    if isinstance(config, dict):
+        config = OutputConfig(**config)
+
+    projected: dict[str, Any] = {}
+    for field_spec in config.fields:
+        raw_value = _resolve_path_value(profile, field_spec.from_)
+        if raw_value is None:
+            if field_spec.required and config.on_missing == "error":
+                raise ProjectionError(f"Required field '{field_spec.path}' is missing")
+            if config.on_missing == "omit":
+                continue
+            projected[field_spec.path] = None
+            continue
+
+        resolved = _normalize_for_projection(raw_value, field_spec.normalize)
+        projected[field_spec.path] = _serialize_field_value(
+            resolved,
+            include_confidence=config.include_confidence,
+            include_provenance=config.include_provenance,
+        )
+    return validate_projected_output(projected, config)
+
+
 def merge_profiles(profiles: list[CanonicalProfile]) -> CanonicalProfile:
     """Merge N partial profiles into one canonical profile."""
     merged = CanonicalProfile()
@@ -587,12 +753,20 @@ def merge_profiles(profiles: list[CanonicalProfile]) -> CanonicalProfile:
     if populated:
         merged.overall_confidence = sum(fv.confidence for fv in populated) / len(populated)
 
-    # Generate stable candidate ID from email or name
+    # Generate stable candidate ID from email or name; fall back to a hash of all observed values.
     id_seed = ""
     if merged.email:
-        id_seed = merged.email.value
+        id_seed = str(merged.email.value)
     elif merged.name:
-        id_seed = merged.name.value
+        id_seed = str(merged.name.value)
+    if not id_seed:
+        values = []
+        for profile in profiles:
+            for fname in CANONICAL_FIELDS:
+                fv = getattr(profile, fname, None)
+                if fv is not None:
+                    values.append(str(getattr(fv, "value", fv)))
+        id_seed = "|".join(v for v in values if v)
     if id_seed:
         merged.candidate_id = "CAND_" + hashlib.sha256(id_seed.encode()).hexdigest()[:12].upper()
     else:

@@ -29,7 +29,7 @@ try:
 except ImportError:
     HAS_DOCX = False
 
-from app.core.transformer import CandidateTransformer
+from app.core.transformer import CandidateTransformer, OutputConfig, ProjectionError
 
 
 # ──────────────────────────────────────────────
@@ -125,6 +125,12 @@ class TransformRequest(BaseModel):
     github_data: Optional[dict[str, Any]] = None   # pre-fetched data (for testing)
     resume_text: Optional[str] = None
     recruiter_notes: Optional[str] = None
+    output_config: Optional[OutputConfig] = None
+
+
+class TransformProjectRequest(BaseModel):
+    profile_request: TransformRequest
+    output_config: Optional[OutputConfig] = None
 
 
 # ──────────────────────────────────────────────
@@ -153,7 +159,31 @@ async def transform_json(req: TransformRequest):
             resume_text=req.resume_text,
             recruiter_notes=req.recruiter_notes,
         )
-        return JSONResponse(content=profile.to_dict())
+        return JSONResponse(content=profile.to_dict(config=req.output_config))
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.post("/transform/project", summary="Transform and project into a configurable output shape")
+async def transform_project(payload: TransformProjectRequest):
+    req = payload.profile_request
+    output_config = payload.output_config or req.output_config
+
+    github_data = req.github_data
+    if req.github_url and not github_data:
+        github_data = await fetch_github_profile(req.github_url)
+
+    try:
+        profile = transformer.transform(
+            csv_row=req.csv_row,
+            ats_blob=req.ats_blob,
+            github_data=github_data,
+            resume_text=req.resume_text,
+            recruiter_notes=req.recruiter_notes,
+        )
+        return JSONResponse(content=profile.to_dict(config=output_config))
+    except ProjectionError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 

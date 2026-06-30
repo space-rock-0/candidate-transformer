@@ -16,7 +16,8 @@ from app.core.transformer import (
     CSVParser, ATSParser, GitHubParser, ResumeParser, RecruiterNotesParser,
     normalize_name, normalize_email, normalize_phone, normalize_skills,
     extract_years_of_experience, SourceType, FieldValue, merge_profiles,
-    CanonicalProfile,
+    CanonicalProfile, FieldSpec, OutputConfig, project_profile, build_default_output_config,
+    ProjectionError,
 )
 
 
@@ -313,6 +314,73 @@ class TestMerger:
         merged = merge_profiles([p])
         assert merged.candidate_id.startswith("CAND_")
         assert merged.candidate_id != "CAND_UNKNOWN"
+
+
+# ──────────────────────────────────────────────
+# Projection / Output Config Tests
+# ──────────────────────────────────────────────
+
+class TestProjection:
+    def _make_profile(self) -> CanonicalProfile:
+        profile = CanonicalProfile()
+        profile.name = FieldValue(value="Alice Smith", source=SourceType.CSV, confidence=0.95)
+        profile.email = FieldValue(value="alice@example.com", source=SourceType.ATS, confidence=0.98)
+        profile.phone = FieldValue(value="+15551234567", source=SourceType.CSV, confidence=0.9)
+        return profile
+
+    def test_projects_subset_of_fields(self):
+        profile = self._make_profile()
+        config = OutputConfig(fields=[
+            FieldSpec(path="primary_email", from_="email", type="string", required=True),
+            FieldSpec(path="display_name", from_="name", type="string"),
+        ], include_confidence=False, include_provenance=False)
+
+        projected = project_profile(profile, config)
+
+        assert projected["primary_email"] == "alice@example.com"
+        assert projected["display_name"] == "Alice Smith"
+
+    def test_supports_alias_for_from_field(self):
+        profile = self._make_profile()
+        config = OutputConfig(fields=[
+            FieldSpec(**{"path": "full_name", "from": "name", "type": "string"}),
+        ], include_confidence=False, include_provenance=False)
+
+        projected = project_profile(profile, config)
+
+        assert projected["full_name"] == "Alice Smith"
+
+    def test_omit_missing_fields_when_requested(self):
+        profile = self._make_profile()
+        profile.phone = None
+        config = OutputConfig(fields=[
+            FieldSpec(path="primary_phone", from_="phone", type="string", required=True),
+        ], on_missing="omit")
+
+        projected = project_profile(profile, config)
+
+        assert "primary_phone" not in projected
+
+    def test_error_on_required_missing_field(self):
+        profile = self._make_profile()
+        profile.email = None
+        config = OutputConfig(fields=[
+            FieldSpec(path="primary_email", from_="email", type="string", required=True),
+        ], on_missing="error")
+
+        with pytest.raises(ProjectionError):
+            project_profile(profile, config)
+
+    def test_provenance_toggle_removes_metadata(self):
+        profile = self._make_profile()
+        config = OutputConfig(fields=[
+            FieldSpec(path="primary_email", from_="email", type="string"),
+        ], include_confidence=False, include_provenance=False)
+
+        projected = project_profile(profile, config)
+
+        assert projected["primary_email"] == "alice@example.com"
+        assert isinstance(projected["primary_email"], str)
 
 
 # ──────────────────────────────────────────────

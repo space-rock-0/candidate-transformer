@@ -87,12 +87,26 @@ downstream system can audit *why* a value was chosen.
 
 ### With Docker (recommended)
 
+From the project root:
+
 ```bash
-docker compose up --build
+docker compose build
+docker compose up -d
 ```
 
-- API: http://localhost:8000 (docs at `/docs`)
-- Dashboard: http://localhost:5173
+Then open:
+
+- API: http://localhost:8000
+- API docs: http://localhost:8000/docs
+- Frontend: http://localhost:5173
+
+The frontend talks to the backend through the nginx proxy at `/api`, so the browser uses the same host and port as the UI.
+
+To stop the containers later:
+
+```bash
+docker compose down
+```
 
 ### Without Docker
 
@@ -129,6 +143,31 @@ curl -X POST http://localhost:8000/transform/json \
 Same as above but accepts actual file uploads (`csv_file`, `resume_file`) plus
 form fields for the rest.
 
+### `POST /transform/project`
+
+Accepts a profile request plus an optional output config to project the merged
+canonical profile into a custom shape. This is the configurable projection layer
+for the requested output/schema requirement.
+
+```bash
+curl -X POST http://localhost:8000/transform/project \
+  -H "Content-Type: application/json" \
+  -d '{
+    "profile_request": {
+      "csv_row": {"name": "Jane Doe", "email": "jane@corp.com"}
+    },
+    "output_config": {
+      "fields": [
+        {"path": "primary_email", "from": "email", "type": "string", "required": true},
+        {"path": "display_name", "from": "name", "type": "string"}
+      ],
+      "include_confidence": false,
+      "include_provenance": false,
+      "on_missing": "omit"
+    }
+  }'
+```
+
 ### `POST /transform/batch`
 
 Accepts an array of up to 50 candidate payloads, processed concurrently.
@@ -142,13 +181,28 @@ cd backend
 pytest tests/ -v
 ```
 
-55 tests covering normalization edge cases, each parser independently, the
-conflict-resolution merge logic, and full end-to-end multi-source transforms —
-including a regression test for a real bug caught during manual stress-testing
-(a more complete phone number losing to a less complete one purely on source
-rank).
+60 tests covering normalization edge cases, each parser independently, the
+conflict-resolution merge logic, full end-to-end multi-source transforms, and
+projection behavior for configurable output shaping — including a regression
+test for a real bug caught during manual stress-testing (a more complete phone
+number losing to a less complete one purely on source rank).
 
 ## Design notes — what "production-ready" meant here
+
+### Match-key policy
+
+For multi-record resolution, the current implementation uses a conservative match
+key of normalized email when present, otherwise a normalized `(name, company)`
+pair. This is a heuristic rather than exact identity resolution, and false
+negatives are preferred over false positives so that different people are not
+incorrectly merged.
+
+### Projection layer
+
+The default serializer now uses the same projection pipeline as the configurable
+output endpoint. This keeps the merge engine unchanged while allowing callers to
+request a subset of fields, remap field names with `from`, and control missing
+field behavior via `on_missing`.
 
 - **No silent failures.** Missing, empty, or malformed sources never crash the
   pipeline — `transform()` accepts any subset of sources, including none.
@@ -171,3 +225,6 @@ rank).
 - Active-learning loop: let recruiters confirm/reject merged conflicts, feeding
   corrections back into confidence weighting.
 - Authentication and per-tenant source isolation.
+- Full schema expansion for arrays/object shapes (`emails`, `phones`, nested
+  `location` / `links`, and per-skill provenance), which remain future work
+  relative to the current projection-focused delivery.
