@@ -4,10 +4,10 @@ ARG VITE_API_BASE=/api
 ENV VITE_API_BASE=${VITE_API_BASE}
 
 WORKDIR /app
-COPY package.json ./
+COPY package.json package-lock.json* ./
 RUN npm install
 COPY . .
-RUN npm run build
+RUN chmod -R 755 node_modules/.bin && npm run build
 
 FROM nginx:1.27-alpine AS production
 
