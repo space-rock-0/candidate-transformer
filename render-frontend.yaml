@@ -1,0 +1,13 @@
+services:
+  - type: web
+    name: candidate-transformer-frontend
+    env: docker
+    region: oregon
+    plan: free
+    rootDir: frontend
+    dockerfilePath: Dockerfile
+    dockerContext: .
+    envVars:
+      - key: VITE_API_BASE
+        value: https://candidate-transformer-2yje.onrender.com
+    healthCheckPath: /
